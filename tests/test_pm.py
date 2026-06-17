@@ -281,6 +281,46 @@ def test_write_brain_file_warns_on_untagged_decision_but_saves():
     assert ok["ok"] is True and ok["warnings"] == []
 
 
+def test_write_brain_file_detects_stale_edit_conflict():
+    brain.pm_brain_init.invoke({})
+    r1 = brain.write_brain_file("knowledge/x.md", "# X\nv1\n")
+    assert r1["ok"] is True and "mtime" in r1
+    # a matching mtime saves fine
+    ok = brain.write_brain_file("knowledge/x.md", "# X\nv2\n", expected_mtime=r1["mtime"])
+    assert ok["ok"] is True
+    # a stale (older) mtime is refused as a conflict, leaving the file untouched
+    stale = brain.write_brain_file("knowledge/x.md", "# X\nv3\n", expected_mtime=r1["mtime"] - 100)
+    assert stale["ok"] is False and stale.get("conflict") is True
+    assert (brain._brain_root() / "knowledge" / "x.md").read_text() == "# X\nv2\n"
+
+
+def test_write_brain_file_rejects_unknown_area():
+    brain.pm_brain_init.invoke({})
+    bad = brain.write_brain_file("competitors/acme.md", "# Acme\n")
+    assert bad["ok"] is False and "area" in bad["error"].lower()
+    # a root-level doc and a known area both save (matches what the UI offers)
+    assert brain.write_brain_file("notes.md", "# Notes\n")["ok"] is True
+    assert brain.write_brain_file("knowledge/ok.md", "# OK\n")["ok"] is True
+
+
+def test_write_brain_file_must_be_new_refuses_existing():
+    brain.pm_brain_init.invoke({})
+    brain.write_brain_file("knowledge/dup.md", "# Dup\nv1\n")
+    res = brain.write_brain_file("knowledge/dup.md", "# Dup\nv2\n", must_be_new=True)
+    assert res["ok"] is False and res.get("conflict") is True
+    assert (brain._brain_root() / "knowledge" / "dup.md").read_text() == "# Dup\nv1\n"
+    # must_be_new on a genuinely new path still saves
+    assert brain.write_brain_file("knowledge/fresh.md", "# Fresh\n", must_be_new=True)["ok"] is True
+
+
+def test_title_of_uses_first_nonempty_line():
+    brain.pm_brain_init.invoke({})
+    brain.write_brain_file("knowledge/z.md", "\n\n# Heading Z\n\nbody\n")
+    f = brain.brain_files()
+    z = next(x for g in f["groups"] for x in g["files"] if x["path"].endswith("z.md"))
+    assert z["title"] == "Heading Z"
+
+
 # ── register() wiring ───────────────────────────────────────────────────────────
 
 
@@ -426,6 +466,45 @@ def test_put_file_route_saves_creates_and_guards():
     assert w.status_code == 200 and w.json()["warnings"]
 
 
+def test_put_file_route_flags_stale_edit_as_409():
+    from fastapi.testclient import TestClient
+
+    brain.pm_brain_init.invoke({})
+    c = TestClient(_app())
+    c.put("/api/plugins/pm/file", json={"path": "knowledge/y.md", "content": "# Y\nv1\n"})
+    got = c.get("/api/plugins/pm/file", params={"path": "knowledge/y.md"}).json()
+    assert "mtime" in got
+    # a stale mtime → 409 conflict, not a silent overwrite
+    stale = c.put(
+        "/api/plugins/pm/file",
+        json={"path": "knowledge/y.md", "content": "# Y\nv2\n", "mtime": got["mtime"] - 100},
+    )
+    assert stale.status_code == 409
+    # the matching mtime saves and returns the fresh mtime
+    ok = c.put(
+        "/api/plugins/pm/file",
+        json={"path": "knowledge/y.md", "content": "# Y\nv2\n", "mtime": got["mtime"]},
+    )
+    assert ok.status_code == 200 and "mtime" in ok.json()
+
+
+def test_put_file_route_new_flag_refuses_existing_file():
+    from fastapi.testclient import TestClient
+
+    brain.pm_brain_init.invoke({})
+    c = TestClient(_app())
+    c.put("/api/plugins/pm/file", json={"path": "knowledge/n.md", "content": "# N\nv1\n"})
+    # creating with new=True over an existing path is refused (409), not overwritten
+    r = c.put(
+        "/api/plugins/pm/file",
+        json={"path": "knowledge/n.md", "content": "clobber", "new": True},
+    )
+    assert r.status_code == 409
+    assert (
+        "v1" in c.get("/api/plugins/pm/file", params={"path": "knowledge/n.md"}).json()["content"]
+    )
+
+
 def test_shell_page_is_four_rules_compliant():
     from pm import view
 
@@ -445,3 +524,18 @@ def test_shell_page_has_browser_and_editor_surface():
     assert '"/api/plugins/pm/file"' in html and 'method:"PUT"' in html  # save route
     assert 'id="ptext"' in html and 'id="psave"' in html  # editor textarea + save
     assert 'id="newform"' in html  # create-new-file affordance
+
+
+def test_shell_page_renders_rows_without_interpolating_user_data():
+    from pm import view
+
+    html = view._SHELL_HTML
+    # user-controlled values go into the DOM via textContent/setAttribute, never an HTML string
+    assert "hydrateRows" in html
+    assert 'setAttribute("data-path"' in html
+    assert "textContent=r.label" in html
+    # the old, injection-prone pattern is gone
+    assert "data-path=\"'+esc(path)" not in html
+    # dashboard fetches run in parallel, and a new file can't silently overwrite an existing one
+    assert "Promise.all" in html
+    assert "new:cur.isNew" in html

@@ -45,15 +45,23 @@ def build_data_router():
             raise HTTPException(400, "path must be inside the PM Brain")
         if not target.exists() or target.suffix != ".md":
             raise HTTPException(404, "no such brain file")
-        return {"path": path, "content": brain._read(target)}
+        return {"path": path, "content": brain._read(target), "mtime": target.stat().st_mtime}
 
     @router.put("/file")
     async def _save(payload: dict = Body(...)) -> dict:
         """Save (or create) a brain file. Guards live in brain.write_brain_file; a guard
-        failure is a 400, a successful save returns any provenance warnings (warn, don't block)."""
-        res = brain.write_brain_file(str(payload.get("path", "")), str(payload.get("content", "")))
+        failure is a 400, a stale-edit conflict is a 409, a successful save returns any
+        provenance warnings (warn, don't block) and the new mtime."""
+        mt = payload.get("mtime")
+        res = brain.write_brain_file(
+            str(payload.get("path", "")),
+            str(payload.get("content", "")),
+            expected_mtime=float(mt) if isinstance(mt, (int, float)) else None,
+            must_be_new=bool(payload.get("new")),
+        )
         if not res.get("ok"):
-            raise HTTPException(400, res.get("error", "could not save"))
+            code = 409 if res.get("conflict") else 400
+            raise HTTPException(code, res.get("error", "could not save"))
         return res
 
     return router
@@ -157,7 +165,8 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   // Areas a human PM can author into from the UI (source/ is read-only audit anchors).
   var NEW_AREAS=["knowledge","decisions","hypotheses","stakeholders","ingestion","rules","maintenance","(root)"];
   $narea.innerHTML=NEW_AREAS.map(function(a){ return '<option value="'+a+'">'+a+'</option>'; }).join("");
-  function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;"); }
+  function esc(s){ return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;"); }
 
   // ── editor panel state ──
   var cur={path:null, editable:false, content:"", isNew:false};
@@ -175,8 +184,9 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     $pedit.style.display="none"; $psave.style.display=""; $pcancel.style.display="";
     $ptext.focus();
   }
-  function showFile(path, editable, content, isNew){
-    cur={path:path, editable:editable, content:content, isNew:!!isNew};
+  function showFile(path, editable, content, isNew, mtime){
+    cur={path:path, editable:editable, content:content, isNew:!!isNew,
+         mtime:(mtime==null?null:mtime), force:false};
     $panel.classList.add("open"); $ptitle.textContent=path; $ptitle.classList.remove("muted");
     $pro.style.display=editable?"none":""; note("");
     $pbody.textContent=content||"(empty)";
@@ -188,17 +198,30 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     $pbody.style.display="block"; $ptext.style.display="none"; note("");
     $pedit.style.display="none"; $psave.style.display="none"; $pcancel.style.display="none"; $pro.style.display="none";
     try{ var r=await kit.apiFetch("/api/plugins/pm/file?path="+encodeURIComponent(path));
-      if(!r.ok) throw 0; var d=await r.json(); showFile(path, editable, d.content||"", false); }
+      if(!r.ok) throw 0; var d=await r.json(); showFile(path, editable, d.content||"", false, d.mtime); }
     catch(e){ $pbody.textContent="Couldn't load "+path; }
   }
   async function save(){
     var body=$ptext.value;
     try{
       var r=await kit.apiFetch("/api/plugins/pm/file", {method:"PUT",
-        headers:{"Content-Type":"application/json"}, body:JSON.stringify({path:cur.path, content:body})});
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({path:cur.path, content:body, mtime:cur.force?null:cur.mtime, new:cur.isNew})});
       var d=await r.json().catch(function(){ return {}; });
-      if(!r.ok){ note(esc(d.detail||"Could not save."), "bad"); return; }
-      cur.content=body; cur.isNew=false; $pbody.textContent=body||"(empty)"; viewMode();
+      if(!r.ok){
+        if(r.status===409 && cur.isNew){
+          // a brand-new file collided with an existing one — never silently overwrite; rename
+          note(esc(d.detail||"A file already exists at that path."), "bad");
+        } else if(r.status===409){
+          cur.force=true;  // user's edits stay in the textarea; next Save overwrites
+          note("This file changed on disk since you opened it. Click Save again to overwrite, "
+            +"or Close and reopen to get the latest.", "bad");
+        } else { note(esc(d.detail||"Could not save."), "bad"); }
+        return;
+      }
+      cur.content=body; cur.isNew=false; cur.force=false;
+      if(d.mtime!=null) cur.mtime=d.mtime;
+      $pbody.textContent=body||"(empty)"; viewMode();
       if(d.warnings&&d.warnings.length){
         note("Saved — "+d.warnings.length+" provenance warning(s):<br>"+d.warnings.map(esc).join("<br>"), "warnnote");
       } else { note("Saved.", "warnnote"); setTimeout(function(){ if($pnote.textContent==="Saved.") note(""); }, 1500); }
@@ -230,9 +253,24 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 
   // ── dashboard cards + file browser ──
   function card(title, inner, cls){ return '<div class="card'+(cls?' '+cls:'')+'"><h2>'+title+'</h2>'+inner+'</div>'; }
+  // Rows carry user-controlled text (filenames, doc titles, stakeholder names). Never interpolate
+  // those into an HTML string — stash them and write them into the DOM via textContent/setAttribute
+  // after the card shells exist (hydrateRows), so a crafted filename can't inject markup.
+  var rowReg=[];
   function fileRow(path, label, meta, editable){
-    return '<div class="row" data-path="'+esc(path)+'" data-editable="'+(editable===false?0:1)+'">'
-      +'<span>'+esc(label)+'</span>'+(meta?'<span class="meta">'+esc(meta)+'</span>':'')+'</div>';
+    var i=rowReg.push({path:path, label:label, meta:meta||"", editable:editable!==false})-1;
+    return '<div class="row" data-i="'+i+'"></div>';
+  }
+  function hydrateRows(){
+    $cols.querySelectorAll(".row[data-i]").forEach(function(el){
+      var r=rowReg[+el.getAttribute("data-i")];
+      if(!r) return;
+      el.setAttribute("data-path", r.path);
+      el.setAttribute("data-editable", r.editable?"1":"0");
+      var s=document.createElement("span"); s.textContent=r.label; el.appendChild(s);
+      if(r.meta){ var m=document.createElement("span"); m.className="meta"; m.textContent=r.meta; el.appendChild(m); }
+      el.addEventListener("click", function(){ openFile(r.path, r.editable); });
+    });
   }
   function browser(f){
     if(!f||!f.exists||!f.groups.length) return "";
@@ -245,6 +283,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   }
 
   function render(s, f){
+    rowReg=[];  // fresh per render; data-i indices point into this
     $root.textContent=s.root; $root.title=s.root;
     if(!s.exists){
       $cols.innerHTML=""; $empty.style.display="block";
@@ -283,17 +322,17 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     html += card('Areas', counts);
 
     $cols.innerHTML=html;
-    $cols.querySelectorAll(".row[data-path]").forEach(function(el){
-      el.addEventListener("click", function(){ openFile(el.getAttribute("data-path"), el.getAttribute("data-editable")!=="0"); });
-    });
+    hydrateRows();
     if(cur.path) markActive(cur.path);
   }
 
   async function load(){
     try{
-      var rs=await kit.apiFetch("/api/plugins/pm/status");
-      var rf=await kit.apiFetch("/api/plugins/pm/files");
-      render(await rs.json(), await rf.json());
+      var res=await Promise.all([
+        kit.apiFetch("/api/plugins/pm/status"),
+        kit.apiFetch("/api/plugins/pm/files")
+      ]);
+      render(await res[0].json(), await res[1].json());
     }catch(e){ /* transient */ }
   }
   document.getElementById("refresh").addEventListener("click", load);

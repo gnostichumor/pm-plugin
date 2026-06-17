@@ -277,9 +277,14 @@ def _safe_target(path: str) -> Path | None:
 
 
 def _title_of(path: Path) -> str:
-    for line in _read(path).splitlines():
-        if line.strip():
-            return line.lstrip("# ").strip()
+    # Read only up to the first non-empty line — don't slurp the whole file just for a title.
+    try:
+        with path.open(encoding="utf-8") as fh:
+            for line in fh:
+                if line.strip():
+                    return line.lstrip("# ").strip()
+    except OSError:
+        pass
     return path.stem
 
 
@@ -309,11 +314,20 @@ def file_warnings(rel_path: str, content: str) -> list[str]:
     return []
 
 
-def write_brain_file(rel_path: str, content: str) -> dict:
+def write_brain_file(
+    rel_path: str,
+    content: str,
+    expected_mtime: float | None = None,
+    must_be_new: bool = False,
+) -> dict:
     """Write a brain file from the UI editor. Guards: must stay inside the brain, `.md` only,
-    and `source/` is read-only (verbatim audit anchors). Decisions/hypotheses get provenance
-    *warnings* but still save. Creates parent dirs, so a brand-new file just works. Returns
-    {ok, path, warnings} or {ok: False, error}."""
+    `source/` is read-only (verbatim audit anchors), and the area must be a real brain area.
+    When `must_be_new` is set, an existing file at the path is refused (a fresh "New file"
+    must not clobber an existing one). When `expected_mtime` is given and the file on disk has
+    changed since (optimistic concurrency), the write is refused as a conflict rather than
+    clobbering a concurrent edit. Decisions/hypotheses get provenance *warnings* but still save.
+    Creates parent dirs, so a brand-new file just works. Returns
+    {ok, path, warnings, mtime} or {ok: False, error[, conflict]}."""
     rel = (rel_path or "").strip().lstrip("/")
     if not rel:
         return {"ok": False, "error": "A file path is required."}
@@ -322,10 +336,32 @@ def write_brain_file(rel_path: str, content: str) -> dict:
         return {"ok": False, "error": "Path must be inside the PM Brain."}
     if target.suffix != ".md":
         return {"ok": False, "error": "Only .md files can be edited."}
-    if next(iter(Path(rel).parts), "") == "source":
+    parts = Path(rel).parts
+    area = parts[0] if len(parts) > 1 else ""  # "" → a root-level doc (INDEX.md, etc.)
+    if area == "source":
         return {"ok": False, "error": "source/ holds verbatim audit anchors and is read-only."}
+    if area and area not in AREAS:
+        return {"ok": False, "error": f"'{area}/' is not a PM Brain area."}
+    if must_be_new and target.exists():
+        return {
+            "ok": False,
+            "conflict": True,
+            "error": "A file already exists at that path — pick a different name.",
+        }
+    if expected_mtime is not None and target.exists():
+        if abs(target.stat().st_mtime - expected_mtime) > 1e-6:
+            return {
+                "ok": False,
+                "conflict": True,
+                "error": "This file changed on disk since you opened it.",
+            }
     _write(target, content)
-    return {"ok": True, "path": _rel(target), "warnings": file_warnings(rel, content)}
+    return {
+        "ok": True,
+        "path": _rel(target),
+        "warnings": file_warnings(rel, content),
+        "mtime": target.stat().st_mtime,
+    }
 
 
 def brain_files() -> dict:
