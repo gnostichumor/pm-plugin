@@ -10,14 +10,35 @@ from __future__ import annotations
 
 
 def build_view_router():
-    from fastapi import APIRouter
-    from fastapi.responses import HTMLResponse
+    from pathlib import Path
+
+    from fastapi import APIRouter, HTTPException
+    from fastapi.responses import HTMLResponse, Response
 
     router = APIRouter()
+
+    _VENDOR = Path(__file__).resolve().parent / "vendor"
+    _VENDOR_FILES = {"marked.min.js", "purify.min.js"}  # exact allowlist — no FS-path input
 
     @router.get("/view")
     async def _view():
         return HTMLResponse(_SHELL_HTML)
+
+    @router.get("/vendor/{name}")
+    async def _vendor(name: str):
+        """Serve the self-contained markdown deps (marked + DOMPurify) same-origin. Public,
+        like the page itself — a <script src> can't carry a bearer. Allowlisted by exact name,
+        so the request never reaches the filesystem with caller-controlled path components."""
+        if name not in _VENDOR_FILES:
+            raise HTTPException(404, "no such asset")
+        f = _VENDOR / name
+        if not f.exists():
+            raise HTTPException(404, "asset missing")
+        return Response(
+            f.read_bytes(),
+            media_type="application/javascript",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     return router
 
@@ -71,6 +92,11 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
 <script>
   window.__base = location.pathname.split("/plugins/")[0];
   document.write('<link rel="stylesheet" href="' + window.__base + '/_ds/plugin-kit.css">');
+  // Self-contained markdown renderer + sanitizer, served same-origin by this plugin (no CDN).
+  // Written during parse so window.marked / window.DOMPurify exist before the deferred module
+  // script runs; if a fetch fails the panel falls back to raw text (see paintBody()).
+  document.write('<scr'+'ipt src="' + window.__base + '/plugins/pm/vendor/marked.min.js"><\/scr'+'ipt>');
+  document.write('<scr'+'ipt src="' + window.__base + '/plugins/pm/vendor/purify.min.js"><\/scr'+'ipt>');
 </script>
 <style>
   html,body{margin:0;height:100%;background:var(--pl-color-bg,#0a0a0c);color:var(--pl-color-fg,#ededed);
@@ -117,6 +143,23 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   #pnote{display:none;padding:8px 14px;font-size:12px;line-height:1.5;border-bottom:1px solid var(--pl-color-border,#2a2a30)}
   #pnote.bad{background:rgba(239,68,68,.14);color:#ef4444}
   #pnote.warnnote{background:rgba(245,158,11,.14);color:#f59e0b}
+  /* rendered-markdown panel (DOMPurify-sanitized marked output) */
+  #prender{display:none;padding:12px 16px;font-size:13px;line-height:1.6;overflow-wrap:anywhere}
+  #prender h1,#prender h2,#prender h3,#prender h4{line-height:1.3;margin:1.1em 0 .5em;font-weight:600}
+  #prender h1{font-size:1.5em}#prender h2{font-size:1.25em}#prender h3{font-size:1.08em}#prender h4{font-size:1em}
+  #prender h1,#prender h2{border-bottom:1px solid var(--pl-color-border,#2a2a30);padding-bottom:.25em}
+  #prender p{margin:.6em 0}#prender ul,#prender ol{margin:.5em 0;padding-left:1.5em}#prender li{margin:.2em 0}
+  #prender a{color:var(--pl-color-accent,#6ea8fe);text-decoration:none}#prender a:hover{text-decoration:underline}
+  #prender code{font-family:var(--pl-font-mono,ui-monospace,Menlo,monospace);font-size:.9em;
+    background:rgba(127,127,127,.16);padding:.1em .35em;border-radius:4px}
+  #prender pre{background:rgba(127,127,127,.10);border:1px solid var(--pl-color-border,#2a2a30);
+    border-radius:6px;padding:10px 12px;overflow:auto}
+  #prender pre code{background:none;padding:0}
+  #prender blockquote{margin:.6em 0;padding:.1em .9em;border-left:3px solid var(--pl-color-border,#2a2a30);color:var(--pl-color-fg-muted,#9aa0aa)}
+  #prender table{border-collapse:collapse;margin:.6em 0;font-size:.95em}
+  #prender th,#prender td{border:1px solid var(--pl-color-border,#2a2a30);padding:4px 8px;text-align:left}
+  #prender hr{border:0;border-top:1px solid var(--pl-color-border,#2a2a30);margin:1em 0}
+  #prender img{max-width:100%}
   .muted{color:var(--pl-color-fg-muted,#9aa0aa)}
 </style></head><body>
 <div id="wrap">
@@ -139,12 +182,14 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
         <span id="ptitle" class="muted"></span>
         <span id="pro" class="pill warn" style="display:none">read-only</span>
         <span class="sp"></span>
+        <button id="praw" class="pl-btn pl-btn--sm" type="button" style="display:none">Raw</button>
         <button id="pedit" class="pl-btn pl-btn--sm" type="button" style="display:none">Edit</button>
         <button id="psave" class="pl-btn pl-btn--sm" type="button" style="display:none">Save</button>
         <button id="pcancel" class="pl-btn pl-btn--sm" type="button" style="display:none">Cancel</button>
         <button id="pclose" class="pl-btn pl-btn--sm" type="button">Close</button>
       </div>
       <div id="pnote"></div>
+      <div id="prender"></div>
       <pre id="pbody"></pre>
       <textarea id="ptext" spellcheck="false"></textarea>
     </div>
@@ -160,8 +205,16 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       $ptext=document.getElementById("ptext"), $pnote=document.getElementById("pnote"),
       $pro=document.getElementById("pro"), $pedit=document.getElementById("pedit"),
       $psave=document.getElementById("psave"), $pcancel=document.getElementById("pcancel"),
+      $prender=document.getElementById("prender"), $praw=document.getElementById("praw"),
       $newform=document.getElementById("newform"), $narea=document.getElementById("narea"),
       $nname=document.getElementById("nname");
+  // Markdown rendering is available only if both vendored libs loaded; otherwise we stay on raw.
+  var MD = !!(window.marked && window.DOMPurify);
+  var rawView = false;  // view-mode toggle: rendered (default) ↔ raw markdown
+  function mdToHtml(src){
+    try { return window.DOMPurify.sanitize(window.marked.parse(src||"", {gfm:true})); }
+    catch(e){ return null; }  // any parser/sanitizer failure → caller falls back to raw
+  }
   // Areas a human PM can author into from the UI (source/ is read-only audit anchors).
   var NEW_AREAS=["knowledge","decisions","hypotheses","stakeholders","ingestion","rules","maintenance","(root)"];
   $narea.innerHTML=NEW_AREAS.map(function(a){ return '<option value="'+a+'">'+a+'</option>'; }).join("");
@@ -174,13 +227,27 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     if(!msg){ $pnote.style.display="none"; return; }
     $pnote.className=kind||""; $pnote.innerHTML=msg; $pnote.style.display="block";
   }
+  // View-mode body painter: rendered markdown by default, raw <pre> when toggled or MD missing.
+  function paintBody(){
+    var c=cur.content||"", useRaw = rawView || !MD, html = useRaw ? null : mdToHtml(c);
+    if(html==null){  // raw, or render failed → show the source verbatim
+      $pbody.textContent = c || "(empty)"; $pbody.style.display="block"; $prender.style.display="none";
+    } else {
+      $prender.innerHTML = c ? html : '<span class="muted">(empty)</span>';
+      $prender.style.display="block"; $pbody.style.display="none";
+    }
+    if(MD){ $praw.style.display=""; $praw.textContent = useRaw ? "Rendered" : "Raw"; }
+    else { $praw.style.display="none"; }
+  }
   function viewMode(){
-    $ptext.style.display="none"; $pbody.style.display="block";
+    $ptext.style.display="none";
     $psave.style.display="none"; $pcancel.style.display="none";
     $pedit.style.display=cur.editable?"":"none";
+    paintBody();
   }
   function editMode(){
-    $ptext.value=cur.content; $ptext.style.display="block"; $pbody.style.display="none";
+    $ptext.value=cur.content; $ptext.style.display="block";
+    $pbody.style.display="none"; $prender.style.display="none"; $praw.style.display="none";
     $pedit.style.display="none"; $psave.style.display=""; $pcancel.style.display="";
     $ptext.focus();
   }
@@ -189,14 +256,14 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
          mtime:(mtime==null?null:mtime), force:false};
     $panel.classList.add("open"); $ptitle.textContent=path; $ptitle.classList.remove("muted");
     $pro.style.display=editable?"none":""; note("");
-    $pbody.textContent=content||"(empty)";
     markActive(path);
     if(isNew) editMode(); else viewMode();
   }
   async function openFile(path, editable){
     $panel.classList.add("open"); $ptitle.textContent=path; $pbody.textContent="Loading…";
-    $pbody.style.display="block"; $ptext.style.display="none"; note("");
-    $pedit.style.display="none"; $psave.style.display="none"; $pcancel.style.display="none"; $pro.style.display="none";
+    $pbody.style.display="block"; $prender.style.display="none"; $ptext.style.display="none"; note("");
+    $pedit.style.display="none"; $psave.style.display="none"; $pcancel.style.display="none";
+    $pro.style.display="none"; $praw.style.display="none";
     try{ var r=await kit.apiFetch("/api/plugins/pm/file?path="+encodeURIComponent(path));
       if(!r.ok) throw 0; var d=await r.json(); showFile(path, editable, d.content||"", false, d.mtime); }
     catch(e){ $pbody.textContent="Couldn't load "+path; }
@@ -221,7 +288,7 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
       }
       cur.content=body; cur.isNew=false; cur.force=false;
       if(d.mtime!=null) cur.mtime=d.mtime;
-      $pbody.textContent=body||"(empty)"; viewMode();
+      viewMode();  // repaint (rendered or raw, per the current toggle)
       if(d.warnings&&d.warnings.length){
         note("Saved — "+d.warnings.length+" provenance warning(s):<br>"+d.warnings.map(esc).join("<br>"), "warnnote");
       } else { note("Saved.", "warnnote"); setTimeout(function(){ if($pnote.textContent==="Saved.") note(""); }, 1500); }
@@ -231,6 +298,22 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   $pedit.addEventListener("click", editMode);
   $pcancel.addEventListener("click", function(){ if(cur.isNew){ $panel.classList.remove("open"); } else { note(""); viewMode(); } });
   $psave.addEventListener("click", save);
+  $praw.addEventListener("click", function(){ rawView=!rawView; paintBody(); });
+  // Links inside rendered markdown must not navigate the iframe. A brain-relative *.md link
+  // (e.g. a provenance pointer like ../ingestion/foo.md) opens that file in this panel instead.
+  $prender.addEventListener("click", function(e){
+    var a=(e.target && e.target.closest) ? e.target.closest("a") : null; if(!a) return;
+    e.preventDefault();
+    var href=(a.getAttribute("href")||"").trim();
+    if(!href || /^[a-z]+:/i.test(href) || href[0]==="#") return;   // external / in-page anchor
+    if(!/\.md(\?|#|$)/i.test(href)) return;                        // only resolve brain docs
+    var segs=cur.path.split("/").slice(0,-1);                      // dir of the current file
+    href.split("#")[0].split("?")[0].split("/").forEach(function(p){
+      if(p===".."){ segs.pop(); } else if(p && p!=="."){ segs.push(p); }
+    });
+    var target=segs.join("/");
+    if(target) openFile(target, target.split("/")[0]!=="source");  // source/ stays read-only
+  });
   document.getElementById("pclose").addEventListener("click", function(){ $panel.classList.remove("open"); markActive(null); });
 
   function markActive(path){
