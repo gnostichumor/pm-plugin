@@ -112,12 +112,16 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
     grid-template-columns:repeat(var(--pm-ncols,3),minmax(0,1fr));gap:14px;align-content:start}
   .card{position:relative;border:1px solid var(--pl-color-border,#2a2a30);border-radius:8px;padding:12px 14px;background:rgba(127,127,127,.05)}
   .card.dragging{opacity:.45}
-  .cardgrip{position:absolute;top:7px;right:13px;cursor:grab;color:var(--pl-color-fg-muted,#9aa0aa);
-    font-size:11px;letter-spacing:-2px;line-height:1;opacity:.4;user-select:none;-webkit-user-select:none}
-  .cardgrip:hover{opacity:1}
+  .cardgrip{position:absolute;top:3px;right:8px;display:flex;align-items:center;justify-content:center;
+    width:28px;height:26px;cursor:grab;color:var(--pl-color-fg-muted,#9aa0aa);font-size:13px;letter-spacing:-2px;
+    line-height:1;opacity:.45;border-radius:6px;user-select:none;-webkit-user-select:none;touch-action:none}
+  .cardgrip:hover{opacity:1;background:rgba(127,127,127,.18)}
+  .cardgrip:active{cursor:grabbing}
   .cardresize{position:absolute;top:0;right:0;width:9px;height:100%;cursor:col-resize;border-radius:0 8px 8px 0}
   .cardresize:hover{background:linear-gradient(to right,transparent,rgba(127,127,127,.28))}
-  .card h2{font-size:12px;margin:0 0 8px;text-transform:uppercase;letter-spacing:.04em;color:var(--pl-color-fg-muted,#9aa0aa)}
+  .card h2{font-size:12px;margin:0 0 8px;padding-right:30px;text-transform:uppercase;letter-spacing:.04em;
+    color:var(--pl-color-fg-muted,#9aa0aa);cursor:grab;user-select:none;-webkit-user-select:none}
+  .card h2:active{cursor:grabbing}
   .row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;cursor:pointer;border-radius:4px}
   .row:hover{background:rgba(127,127,127,.10)}
   .row .meta{margin-left:auto;color:var(--pl-color-fg-muted,#9aa0aa);font-size:11px;white-space:nowrap}
@@ -294,11 +298,15 @@ _SHELL_HTML = r"""<!doctype html><html><head><meta charset="utf-8">
   }
   function wireCards(){
     $cols.querySelectorAll(".card").forEach(function(c){
-      var grip=c.querySelector(".cardgrip"), rez=c.querySelector(".cardresize");
-      if(grip && !grip._w){ grip._w=1;
-        // native DnD: arm draggable only while the grip is held, so row clicks stay unaffected.
-        grip.addEventListener("mousedown", function(){ c.setAttribute("draggable","true"); });
-        grip.addEventListener("mouseup", function(){ c.removeAttribute("draggable"); });
+      var rez=c.querySelector(".cardresize");
+      if(!c._w){ c._w=1;
+        // native DnD: arm draggable only while a handle (the grip OR the whole card header) is
+        // held, so the drag target is generous but row clicks elsewhere stay unaffected.
+        var arm=function(){ c.setAttribute("draggable","true"); };
+        var disarm=function(){ c.removeAttribute("draggable"); };
+        [c.querySelector(".cardgrip"), c.querySelector("h2")].forEach(function(handle){
+          if(handle){ handle.addEventListener("mousedown", arm); handle.addEventListener("mouseup", disarm); }
+        });
         c.addEventListener("dragstart", function(e){ c.classList.add("dragging");
           if(e.dataTransfer){ e.dataTransfer.effectAllowed="move"; try{ e.dataTransfer.setData("text/plain",""); }catch(_){} } });
         c.addEventListener("dragend", function(){ c.classList.remove("dragging"); c.removeAttribute("draggable"); persistOrder(); });
